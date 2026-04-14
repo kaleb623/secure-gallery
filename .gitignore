@@ -1,0 +1,8 @@
+node_modules/
+.env
+Crew Images/
+.DS_Store
+dist/
+dist-ssr/
+*.local
+.npm/
