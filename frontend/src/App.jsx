@@ -12,7 +12,7 @@ function App() {
   useEffect(() => {
     if (token) {
       // Verify token with backend
-      fetch('http://localhost:3001/api/verify', {
+      fetch('/api/verify', {
         headers: { 'Authorization': `Bearer ${token}` }
       })
       .then(res => {

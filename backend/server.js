@@ -1,15 +1,20 @@
-require('dotenv').config();
+const path = require('path');
+require('dotenv').config({ path: path.join(__dirname, '.env') });
 const express = require('express');
 const cors = require('cors');
 const fs = require('fs');
-const path = require('path');
 const jwt = require('jsonwebtoken');
 
 const app = express();
 const PORT = process.env.PORT || 3001;
 const SECRET_KEY = process.env.JWT_SECRET || 'secret';
 const PASSWORD = process.env.PASSWORD || 'password';
-const BASE_DIR = process.env.CREW_IMAGES_PATH;
+const BASE_DIR = path.resolve(process.env.CREW_IMAGES_PATH || path.join(__dirname, '../../Crew Images'));
+
+console.log(`[Gallery] Media directory resolved to: ${BASE_DIR}`);
+if (!fs.existsSync(BASE_DIR)) {
+    console.warn(`[Gallery WARNING] Media directory does NOT exist at: ${BASE_DIR}`);
+}
 
 app.use(cors());
 app.use(express.json());
@@ -77,7 +82,7 @@ const getContentTypeForExt = (ext) => {
 
 const isValidFile = (filename) => {
     const ext = path.extname(filename).toLowerCase();
-    const mediaExtensions = ['.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp', '.mp4', '.webm', '.ogg', '.mov', '.7z'];
+    const mediaExtensions = ['.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp', '.mp4', '.webm', '.ogg', '.mov'];
     return mediaExtensions.includes(ext);
 };
 
@@ -136,6 +141,178 @@ app.get('/api/contents', authenticateToken, (req, res) => {
     }
 });
 
+// Streamlined All-Media Index with Category Merging & Year/Month Hierarchy
+const MONTH_NAMES = [
+    'January', 'February', 'March', 'April', 'May', 'June',
+    'July', 'August', 'September', 'October', 'November', 'December'
+];
+const MONTH_LOWER_MAP = {};
+MONTH_NAMES.forEach((m, idx) => {
+    MONTH_LOWER_MAP[m.toLowerCase()] = { name: m, order: idx + 1 };
+});
+
+let mediaCache = {
+    timestamp: 0,
+    data: null
+};
+
+app.get('/api/all-media', authenticateToken, (req, res) => {
+    try {
+        const now = Date.now();
+        const forceRefresh = req.query.refresh === 'true';
+        if (!forceRefresh && mediaCache.data && (now - mediaCache.timestamp < 60000)) {
+            return res.json(mediaCache.data);
+        }
+
+        const allFiles = [];
+        const categoryMap = {};
+        const yearMonthMap = {};
+
+        const walkDir = (currentDir, relativePath = '') => {
+            const items = fs.readdirSync(currentDir, { withFileTypes: true });
+            for (const item of items) {
+                const itemRelPath = relativePath ? path.join(relativePath, item.name).replace(/\\/g, '/') : item.name;
+                const fullItemPath = path.join(currentDir, item.name);
+
+                if (item.isDirectory()) {
+                    walkDir(fullItemPath, itemRelPath);
+                } else if (isValidFile(item.name)) {
+                    let stats = null;
+                    try {
+                        stats = fs.statSync(fullItemPath);
+                    } catch (err) {}
+
+                    const pathParts = relativePath ? relativePath.replace(/\\/g, '/').split('/') : [];
+                    
+                    // Extract Year and Month from path
+                    let detectedYear = null;
+                    let detectedMonth = null;
+                    let detectedCategory = null;
+
+                    for (const p of pathParts) {
+                        const cleanP = p.trim();
+                        // Year detection (e.g. 2020, 2021, 2022, 21020 typo, 21021 typo)
+                        if (/2020|21020/.test(cleanP)) {
+                            detectedYear = '2020';
+                        } else if (/2021|21021/.test(cleanP)) {
+                            detectedYear = '2021';
+                        } else if (/2022/.test(cleanP)) {
+                            detectedYear = '2022';
+                        } else if (/^20\d\d$/.test(cleanP)) {
+                            detectedYear = cleanP;
+                        }
+
+                        // Month detection
+                        const lowerP = cleanP.toLowerCase();
+                        if (MONTH_LOWER_MAP[lowerP]) {
+                            detectedMonth = MONTH_LOWER_MAP[lowerP].name;
+                        }
+                    }
+
+                    // Extract non-date descriptive category
+                    for (let i = pathParts.length - 1; i >= 0; i--) {
+                        const p = pathParts[i];
+                        const isYr = /2020|2021|2022|21020|21021|^20\d\d$/.test(p);
+                        const isMo = !!MONTH_LOWER_MAP[p.toLowerCase()];
+                        if (!isYr && !isMo) {
+                            detectedCategory = p;
+                            break;
+                        }
+                    }
+
+                    if (!detectedCategory) {
+                        detectedCategory = pathParts.length > 0 ? pathParts[0] : 'Root';
+                    }
+
+                    // Normalize names like 'GTA World Camera Pics' / 'gta-world-camera'
+                    if (/gta.*camera/i.test(detectedCategory)) {
+                        detectedCategory = 'GTA World Camera';
+                    }
+
+                    // Aggregate category
+                    categoryMap[detectedCategory] = (categoryMap[detectedCategory] || 0) + 1;
+
+                    // Aggregate year/month
+                    if (detectedYear) {
+                        if (!yearMonthMap[detectedYear]) {
+                            yearMonthMap[detectedYear] = { total: 0, months: {} };
+                        }
+                        yearMonthMap[detectedYear].total++;
+                        if (detectedMonth) {
+                            yearMonthMap[detectedYear].months[detectedMonth] = (yearMonthMap[detectedYear].months[detectedMonth] || 0) + 1;
+                        }
+                    }
+
+                    allFiles.push({
+                        name: item.name,
+                        path: relativePath,
+                        fullRelativePath: itemRelPath,
+                        category: detectedCategory,
+                        year: detectedYear,
+                        month: detectedMonth,
+                        size: stats ? stats.size : 0,
+                        lastModified: stats ? stats.mtime : null
+                    });
+                }
+            }
+        };
+
+        if (fs.existsSync(BASE_DIR)) {
+            walkDir(BASE_DIR);
+        }
+
+        // Custom ordering: 'Pics', 'Old GTAW', then rest by count
+        const priorityCategories = ['Pics', 'Old GTAW'];
+        const allCatNames = Object.keys(categoryMap);
+        
+        const sortedCategories = allCatNames
+            .map(name => ({ name, count: categoryMap[name] }))
+            .sort((a, b) => {
+                const aPrio = priorityCategories.indexOf(a.name);
+                const bPrio = priorityCategories.indexOf(b.name);
+                if (aPrio !== -1 && bPrio !== -1) return aPrio - bPrio;
+                if (aPrio !== -1) return -1;
+                if (bPrio !== -1) return 1;
+                return b.count - a.count;
+            });
+
+        // Format Year / Month Tree (Months sorted chronologically)
+        const yearsTree = Object.keys(yearMonthMap)
+            .sort()
+            .map(yr => {
+                const yrData = yearMonthMap[yr];
+                const sortedMonths = MONTH_NAMES
+                    .filter(m => yrData.months[m])
+                    .map(m => ({
+                        name: m,
+                        count: yrData.months[m]
+                    }));
+
+                return {
+                    year: yr,
+                    total: yrData.total,
+                    months: sortedMonths
+                };
+            });
+
+        mediaCache = {
+            timestamp: now,
+            data: {
+                total: allFiles.length,
+                categories: sortedCategories,
+                yearsTree: yearsTree,
+                files: allFiles
+            }
+        };
+
+        res.json(mediaCache.data);
+    } catch (error) {
+        console.error(error);
+        res.status(500).json({ error: 'Failed to index media files' });
+    }
+});
+
+
 // Stream Media Files
 app.get('/api/media', authenticateToken, (req, res) => {
     try {
@@ -192,6 +369,83 @@ app.get('/api/download', authenticateToken, (req, res) => {
         res.status(400).json({ error: 'Invalid file path' });
     }
 });
+
+// Archive Info Endpoint
+app.get('/api/archive-info', authenticateToken, (req, res) => {
+    try {
+        if (process.env.ARCHIVE_DOWNLOAD_URL) {
+            return res.json({
+                exists: true,
+                filename: 'Crew Images.7z',
+                sizeFormatted: '10.6 GB',
+                externalUrl: process.env.ARCHIVE_DOWNLOAD_URL
+            });
+        }
+
+        const archivePath = path.join(BASE_DIR, 'Crew Images.7z');
+        if (fs.existsSync(archivePath)) {
+            const stat = fs.statSync(archivePath);
+            return res.json({
+                exists: true,
+                filename: 'Crew Images.7z',
+                sizeBytes: stat.size,
+                sizeFormatted: `${(stat.size / (1024 * 1024 * 1024)).toFixed(1)} GB`
+            });
+        }
+        const rootItems = fs.readdirSync(BASE_DIR);
+        const altArchive = rootItems.find(f => f.toLowerCase().endsWith('.7z') || f.toLowerCase().endsWith('.zip'));
+        if (altArchive) {
+            const altPath = path.join(BASE_DIR, altArchive);
+            const stat = fs.statSync(altPath);
+            return res.json({
+                exists: true,
+                filename: altArchive,
+                sizeBytes: stat.size,
+                sizeFormatted: `${(stat.size / (1024 * 1024 * 1024)).toFixed(1)} GB`
+            });
+        }
+        res.json({ exists: false });
+    } catch (error) {
+        res.json({ exists: false });
+    }
+});
+
+// Download Entire Archive
+app.get('/api/download-archive', authenticateToken, (req, res) => {
+    try {
+        if (process.env.ARCHIVE_DOWNLOAD_URL) {
+            return res.redirect(process.env.ARCHIVE_DOWNLOAD_URL);
+        }
+
+        let archivePath = path.join(BASE_DIR, 'Crew Images.7z');
+        if (!fs.existsSync(archivePath)) {
+            const rootItems = fs.readdirSync(BASE_DIR);
+            const altArchive = rootItems.find(f => f.toLowerCase().endsWith('.7z') || f.toLowerCase().endsWith('.zip'));
+            if (altArchive) {
+                archivePath = path.join(BASE_DIR, altArchive);
+            } else {
+                return res.status(404).json({ error: 'Archive file not found' });
+            }
+        }
+        res.download(archivePath, path.basename(archivePath));
+    } catch (error) {
+        console.error(error);
+        res.status(500).json({ error: 'Failed to download archive' });
+    }
+});
+
+// Serve frontend build in production if available
+const frontendDist = path.join(__dirname, '../frontend/dist');
+if (fs.existsSync(frontendDist)) {
+    app.use(express.static(frontendDist));
+    app.use((req, res) => {
+        // Don't intercept API routes that 404
+        if (req.path.startsWith('/api/')) {
+            return res.status(404).json({ error: 'Endpoint not found' });
+        }
+        res.sendFile(path.join(frontendDist, 'index.html'));
+    });
+}
 
 app.listen(PORT, () => {
     console.log(`Backend server running on http://localhost:${PORT}`);
