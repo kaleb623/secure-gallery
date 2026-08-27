@@ -4,6 +4,7 @@ const express = require('express');
 const cors = require('cors');
 const fs = require('fs');
 const jwt = require('jsonwebtoken');
+const pLimit = require('p-limit');
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -30,7 +31,7 @@ const authenticateToken = (req, res, next) => {
     
     if (!token) return res.status(401).json({ error: 'Unauthorized' });
 
-    jwt.verify(token, SECRET_KEY, (err, user) => {
+    jwt.verify(token, SECRET_KEY, { algorithms: ['HS256'] }, (err, user) => {
         if (err) return res.status(403).json({ error: 'Forbidden' });
         req.user = user;
         next();
@@ -57,7 +58,8 @@ const getSafePath = (targetPath) => {
     const safePath = path.normalize(path.join(BASE_DIR, targetPath));
     const normalizedBaseDir = path.normalize(BASE_DIR);
     
-    if (!safePath.startsWith(normalizedBaseDir)) {
+    const relative = path.relative(normalizedBaseDir, safePath);
+    if (relative.startsWith('..') || path.isAbsolute(relative)) {
         throw new Error('Access denied');
     }
     return safePath;
@@ -91,35 +93,39 @@ app.get('/api/verify', authenticateToken, (req, res) => {
 });
 
 // List Directory Contents
-app.get('/api/contents', authenticateToken, (req, res) => {
+app.get('/api/contents', authenticateToken, async (req, res) => {
     try {
         const dirPath = getSafePath(req.query.path);
         
-        if (!fs.existsSync(dirPath)) {
+        try {
+            await fs.promises.access(dirPath);
+        } catch {
             return res.status(404).json({ error: 'Directory not found' });
         }
         
-        const items = fs.readdirSync(dirPath, { withFileTypes: true });
+        const items = await fs.promises.readdir(dirPath, { withFileTypes: true });
         
-        const contents = items
-            .map(item => {
-                const itemPath = path.join(dirPath, item.name);
-                const isDir = item.isDirectory();
-                
-                if (!isDir && !isValidFile(item.name)) return null;
+        const limit = pLimit(50);
+        let contents = await Promise.all(items.map(item => limit(async () => {
+            const itemPath = path.join(dirPath, item.name);
+            const isDir = item.isDirectory();
 
-                let stats = null;
-                try {
-                    stats = fs.statSync(itemPath);
-                } catch (err) {}
+            if (!isDir && !isValidFile(item.name)) return null;
 
-                return {
-                    name: item.name,
-                    isDirectory: isDir,
-                    size: stats ? stats.size : 0,
-                    lastModified: stats ? stats.mtime : null
-                };
-            })
+            let stats = null;
+            try {
+                stats = await fs.promises.stat(itemPath);
+            } catch (err) {}
+
+            return {
+                name: item.name,
+                isDirectory: isDir,
+                size: stats ? stats.size : 0,
+                lastModified: stats ? stats.mtime : null
+            };
+        })));
+
+        contents = contents
             .filter(Boolean)
             .sort((a, b) => {
                 if (a.isDirectory !== b.isDirectory) {
@@ -156,7 +162,7 @@ let mediaCache = {
     data: null
 };
 
-app.get('/api/all-media', authenticateToken, (req, res) => {
+app.get('/api/all-media', authenticateToken, async (req, res) => {
     try {
         const now = Date.now();
         const forceRefresh = req.query.refresh === 'true';
@@ -168,97 +174,117 @@ app.get('/api/all-media', authenticateToken, (req, res) => {
         const categoryMap = {};
         const yearMonthMap = {};
 
-        const walkDir = (currentDir, relativePath = '') => {
-            const items = fs.readdirSync(currentDir, { withFileTypes: true });
+        const limit = pLimit(50);
+
+        const walkDir = async (currentDir, relativePath = '') => {
+            let items = [];
+            try {
+                items = await fs.promises.readdir(currentDir, { withFileTypes: true });
+            } catch (err) {
+                return;
+            }
+
+            const filePromises = [];
+            const dirPromises = [];
+
             for (const item of items) {
                 const itemRelPath = relativePath ? path.join(relativePath, item.name).replace(/\\/g, '/') : item.name;
                 const fullItemPath = path.join(currentDir, item.name);
 
                 if (item.isDirectory()) {
-                    walkDir(fullItemPath, itemRelPath);
+                    // Do not wrap recursive directory calls in limit to prevent deadlock
+                    dirPromises.push(walkDir(fullItemPath, itemRelPath));
                 } else if (isValidFile(item.name)) {
-                    let stats = null;
-                    try {
-                        stats = fs.statSync(fullItemPath);
-                    } catch (err) {}
+                    filePromises.push(limit(async () => {
+                        let stats = null;
+                        try {
+                            stats = await fs.promises.stat(fullItemPath);
+                        } catch (err) {}
 
-                    const pathParts = relativePath ? relativePath.replace(/\\/g, '/').split('/') : [];
-                    
-                    // Extract Year and Month from path
-                    let detectedYear = null;
-                    let detectedMonth = null;
-                    let detectedCategory = null;
+                        const pathParts = relativePath ? relativePath.replace(/\\/g, '/').split('/') : [];
 
-                    for (const p of pathParts) {
-                        const cleanP = p.trim();
-                        // Year detection (e.g. 2020, 2021, 2022, 21020 typo, 21021 typo)
-                        if (/2020|21020/.test(cleanP)) {
-                            detectedYear = '2020';
-                        } else if (/2021|21021/.test(cleanP)) {
-                            detectedYear = '2021';
-                        } else if (/2022/.test(cleanP)) {
-                            detectedYear = '2022';
-                        } else if (/^20\d\d$/.test(cleanP)) {
-                            detectedYear = cleanP;
+                        // Extract Year and Month from path
+                        let detectedYear = null;
+                        let detectedMonth = null;
+                        let detectedCategory = null;
+
+                        for (const p of pathParts) {
+                            const cleanP = p.trim();
+                            // Year detection (e.g. 2020, 2021, 2022, 21020 typo, 21021 typo)
+                            if (/2020|21020/.test(cleanP)) {
+                                detectedYear = '2020';
+                            } else if (/2021|21021/.test(cleanP)) {
+                                detectedYear = '2021';
+                            } else if (/2022/.test(cleanP)) {
+                                detectedYear = '2022';
+                            } else if (/^20\d\d$/.test(cleanP)) {
+                                detectedYear = cleanP;
+                            }
+
+                            // Month detection
+                            const lowerP = cleanP.toLowerCase();
+                            if (MONTH_LOWER_MAP[lowerP]) {
+                                detectedMonth = MONTH_LOWER_MAP[lowerP].name;
+                            }
                         }
 
-                        // Month detection
-                        const lowerP = cleanP.toLowerCase();
-                        if (MONTH_LOWER_MAP[lowerP]) {
-                            detectedMonth = MONTH_LOWER_MAP[lowerP].name;
+                        // Extract non-date descriptive category
+                        for (let i = pathParts.length - 1; i >= 0; i--) {
+                            const p = pathParts[i];
+                            const isYr = /2020|2021|2022|21020|21021|^20\d\d$/.test(p);
+                            const isMo = !!MONTH_LOWER_MAP[p.toLowerCase()];
+                            if (!isYr && !isMo) {
+                                detectedCategory = p;
+                                break;
+                            }
                         }
-                    }
 
-                    // Extract non-date descriptive category
-                    for (let i = pathParts.length - 1; i >= 0; i--) {
-                        const p = pathParts[i];
-                        const isYr = /2020|2021|2022|21020|21021|^20\d\d$/.test(p);
-                        const isMo = !!MONTH_LOWER_MAP[p.toLowerCase()];
-                        if (!isYr && !isMo) {
-                            detectedCategory = p;
-                            break;
+                        if (!detectedCategory) {
+                            detectedCategory = pathParts.length > 0 ? pathParts[0] : 'Root';
                         }
-                    }
 
-                    if (!detectedCategory) {
-                        detectedCategory = pathParts.length > 0 ? pathParts[0] : 'Root';
-                    }
-
-                    // Normalize names like 'GTA World Camera Pics' / 'gta-world-camera'
-                    if (/gta.*camera/i.test(detectedCategory)) {
-                        detectedCategory = 'GTA World Camera';
-                    }
-
-                    // Aggregate category
-                    categoryMap[detectedCategory] = (categoryMap[detectedCategory] || 0) + 1;
-
-                    // Aggregate year/month
-                    if (detectedYear) {
-                        if (!yearMonthMap[detectedYear]) {
-                            yearMonthMap[detectedYear] = { total: 0, months: {} };
+                        // Normalize names like 'GTA World Camera Pics' / 'gta-world-camera'
+                        if (/gta.*camera/i.test(detectedCategory)) {
+                            detectedCategory = 'GTA World Camera';
                         }
-                        yearMonthMap[detectedYear].total++;
-                        if (detectedMonth) {
-                            yearMonthMap[detectedYear].months[detectedMonth] = (yearMonthMap[detectedYear].months[detectedMonth] || 0) + 1;
-                        }
-                    }
 
-                    allFiles.push({
-                        name: item.name,
-                        path: relativePath,
-                        fullRelativePath: itemRelPath,
-                        category: detectedCategory,
-                        year: detectedYear,
-                        month: detectedMonth,
-                        size: stats ? stats.size : 0,
-                        lastModified: stats ? stats.mtime : null
-                    });
+                        // Aggregate category
+                        categoryMap[detectedCategory] = (categoryMap[detectedCategory] || 0) + 1;
+
+                        // Aggregate year/month
+                        if (detectedYear) {
+                            if (!yearMonthMap[detectedYear]) {
+                                yearMonthMap[detectedYear] = { total: 0, months: {} };
+                            }
+                            yearMonthMap[detectedYear].total++;
+                            if (detectedMonth) {
+                                yearMonthMap[detectedYear].months[detectedMonth] = (yearMonthMap[detectedYear].months[detectedMonth] || 0) + 1;
+                            }
+                        }
+
+                        allFiles.push({
+                            name: item.name,
+                            path: relativePath,
+                            fullRelativePath: itemRelPath,
+                            category: detectedCategory,
+                            year: detectedYear,
+                            month: detectedMonth,
+                            size: stats ? stats.size : 0,
+                            lastModified: stats ? stats.mtime : null
+                        });
+                    }));
                 }
             }
+
+            await Promise.all(filePromises);
+            await Promise.all(dirPromises);
         };
 
-        if (fs.existsSync(BASE_DIR)) {
-            walkDir(BASE_DIR);
+        try {
+            await fs.promises.access(BASE_DIR);
+            await walkDir(BASE_DIR);
+        } catch (err) {
+            // BASE_DIR might not exist
         }
 
         // Custom ordering: 'Pics', 'Old GTAW', then rest by count
@@ -314,15 +340,17 @@ app.get('/api/all-media', authenticateToken, (req, res) => {
 
 
 // Stream Media Files
-app.get('/api/media', authenticateToken, (req, res) => {
+app.get('/api/media', authenticateToken, async (req, res) => {
     try {
         const filePath = getSafePath(req.query.path);
         
-        if (!fs.existsSync(filePath)) {
+        try {
+            await fs.promises.access(filePath);
+        } catch {
             return res.status(404).json({ error: 'File not found' });
         }
         
-        const stat = fs.statSync(filePath);
+        const stat = await fs.promises.stat(filePath);
         const ext = path.extname(filePath).toLowerCase();
         const contentType = getContentTypeForExt(ext);
         
@@ -357,10 +385,12 @@ app.get('/api/media', authenticateToken, (req, res) => {
 });
 
 // Download Route
-app.get('/api/download', authenticateToken, (req, res) => {
+app.get('/api/download', authenticateToken, async (req, res) => {
     try {
         const filePath = getSafePath(req.query.path);
-        if (!fs.existsSync(filePath)) {
+        try {
+            await fs.promises.access(filePath);
+        } catch {
             return res.status(404).json({ error: 'File not found' });
         }
         res.download(filePath);
@@ -371,7 +401,7 @@ app.get('/api/download', authenticateToken, (req, res) => {
 });
 
 // Archive Info Endpoint
-app.get('/api/archive-info', authenticateToken, (req, res) => {
+app.get('/api/archive-info', authenticateToken, async (req, res) => {
     try {
         if (process.env.ARCHIVE_DOWNLOAD_URL) {
             return res.json({
@@ -383,26 +413,40 @@ app.get('/api/archive-info', authenticateToken, (req, res) => {
         }
 
         const archivePath = path.join(BASE_DIR, 'Crew Images.7z');
-        if (fs.existsSync(archivePath)) {
-            const stat = fs.statSync(archivePath);
+        try {
+            await fs.promises.access(archivePath);
+            const stat = await fs.promises.stat(archivePath);
             return res.json({
                 exists: true,
                 filename: 'Crew Images.7z',
                 sizeBytes: stat.size,
                 sizeFormatted: `${(stat.size / (1024 * 1024 * 1024)).toFixed(1)} GB`
             });
+        } catch {
+            // File does not exist, continue
         }
-        const rootItems = fs.readdirSync(BASE_DIR);
+
+        let rootItems = [];
+        try {
+            rootItems = await fs.promises.readdir(BASE_DIR);
+        } catch {
+            return res.json({ exists: false });
+        }
+
         const altArchive = rootItems.find(f => f.toLowerCase().endsWith('.7z') || f.toLowerCase().endsWith('.zip'));
         if (altArchive) {
             const altPath = path.join(BASE_DIR, altArchive);
-            const stat = fs.statSync(altPath);
-            return res.json({
-                exists: true,
-                filename: altArchive,
-                sizeBytes: stat.size,
-                sizeFormatted: `${(stat.size / (1024 * 1024 * 1024)).toFixed(1)} GB`
-            });
+            try {
+                const stat = await fs.promises.stat(altPath);
+                return res.json({
+                    exists: true,
+                    filename: altArchive,
+                    sizeBytes: stat.size,
+                    sizeFormatted: `${(stat.size / (1024 * 1024 * 1024)).toFixed(1)} GB`
+                });
+            } catch {
+                return res.json({ exists: false });
+            }
         }
         res.json({ exists: false });
     } catch (error) {
@@ -411,15 +455,22 @@ app.get('/api/archive-info', authenticateToken, (req, res) => {
 });
 
 // Download Entire Archive
-app.get('/api/download-archive', authenticateToken, (req, res) => {
+app.get('/api/download-archive', authenticateToken, async (req, res) => {
     try {
         if (process.env.ARCHIVE_DOWNLOAD_URL) {
             return res.redirect(process.env.ARCHIVE_DOWNLOAD_URL);
         }
 
         let archivePath = path.join(BASE_DIR, 'Crew Images.7z');
-        if (!fs.existsSync(archivePath)) {
-            const rootItems = fs.readdirSync(BASE_DIR);
+        try {
+            await fs.promises.access(archivePath);
+        } catch {
+            let rootItems = [];
+            try {
+                rootItems = await fs.promises.readdir(BASE_DIR);
+            } catch {
+                return res.status(404).json({ error: 'Archive file not found' });
+            }
             const altArchive = rootItems.find(f => f.toLowerCase().endsWith('.7z') || f.toLowerCase().endsWith('.zip'));
             if (altArchive) {
                 archivePath = path.join(BASE_DIR, altArchive);
