@@ -5,6 +5,8 @@ const cors = require('cors');
 const fs = require('fs');
 const jwt = require('jsonwebtoken');
 const pLimit = require('p-limit');
+const sharp = require('sharp');
+const crypto = require('crypto');
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -338,6 +340,84 @@ app.get('/api/all-media', authenticateToken, async (req, res) => {
     }
 });
 
+
+const CACHE_DIR = path.join(__dirname, '.cache/thumbnails');
+if (!fs.existsSync(CACHE_DIR)) {
+    fs.mkdirSync(CACHE_DIR, { recursive: true });
+}
+
+// Global queue for image processing to prevent CPU overload
+const imageProcessingLimit = pLimit(4); // 4 concurrent sharp tasks
+
+// Generate and serve optimized WebP thumbnails
+app.get('/api/thumbnail', authenticateToken, async (req, res) => {
+    try {
+        const filePath = getSafePath(req.query.path);
+
+        try {
+            await fs.promises.access(filePath);
+        } catch {
+            return res.status(404).json({ error: 'File not found' });
+        }
+
+        const ext = path.extname(filePath).toLowerCase();
+
+        if (['.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp'].includes(ext)) {
+            const stat = await fs.promises.stat(filePath);
+            const hash = crypto.createHash('md5').update(filePath + stat.mtimeMs).digest('hex');
+            const cachedThumbPath = path.join(CACHE_DIR, `${hash}.webp`);
+
+            try {
+                await fs.promises.access(cachedThumbPath);
+                // Serve cached thumbnail
+                res.writeHead(200, {
+                    'Content-Type': 'image/webp',
+                    'Cache-Control': 'public, max-age=864000'
+                });
+                return fs.createReadStream(cachedThumbPath).pipe(res);
+            } catch (err) {
+                // Cached file does not exist, queue processing
+                await imageProcessingLimit(async () => {
+                    try {
+                        // Check again in case it was processed while we waited in queue
+                        try {
+                            await fs.promises.access(cachedThumbPath);
+                        } catch {
+                            await sharp(filePath)
+                                .rotate() // auto-rotate based on EXIF data
+                                .resize({ width: 300, withoutEnlargement: true })
+                                .webp({ quality: 75 })
+                                .toFile(cachedThumbPath);
+                        }
+                    } catch (sharpError) {
+                        // Ignore corrupt files during thumbnail generation, will just fall back
+                        console.error('Sharp processing error:', sharpError);
+                    }
+                });
+
+                try {
+                    await fs.promises.access(cachedThumbPath);
+                    res.writeHead(200, {
+                        'Content-Type': 'image/webp',
+                        'Cache-Control': 'public, max-age=864000'
+                    });
+                    fs.createReadStream(cachedThumbPath)
+                        .on('error', () => { res.end(); })
+                        .pipe(res);
+                } catch {
+                    // If generation failed, fallback to original
+                    res.redirect(`/api/media?path=${encodeURIComponent(req.query.path)}&token=${req.query.token || ''}`);
+                }
+            }
+        } else {
+            // For videos, redirect to original media endpoint or let frontend handle
+            res.redirect(`/api/media?path=${encodeURIComponent(req.query.path)}&token=${req.query.token || ''}`);
+        }
+    } catch (error) {
+        console.error(error);
+        res.status(400).json({ error: 'Invalid file path' });
+    }
+});
 
 // Stream Media Files
 app.get('/api/media', authenticateToken, async (req, res) => {

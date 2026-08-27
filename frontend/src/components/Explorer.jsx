@@ -38,6 +38,7 @@ const MediaCard = ({ item, path, token, onClick, showCategory = false }) => {
   const isArchive = item.name.match(/\.(7z|zip|rar)$/i);
   const itemPath = item.fullRelativePath || (path ? `${path}/${item.name}` : item.name);
   const mediaUrl = `/api/media?path=${encodeURIComponent(itemPath)}&token=${token}`;
+  const thumbnailUrl = `/api/thumbnail?path=${encodeURIComponent(itemPath)}&token=${token}`;
 
   return (
     <div
@@ -58,7 +59,7 @@ const MediaCard = ({ item, path, token, onClick, showCategory = false }) => {
               <FileIcon size={64} color="var(--accent)" />
             </div>
           ) : (
-            <img src={mediaUrl} alt={item.name} className="file-thumbnail" loading="lazy" />
+            <img src={thumbnailUrl} alt={item.name} className="file-thumbnail" loading="lazy" />
           )
         ) : (
           <div className="observer-placeholder" />
